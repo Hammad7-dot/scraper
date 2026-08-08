@@ -3,12 +3,15 @@ The Polite Scraper — Books to Scrape
 FlyRank Internship, Backend Track, Week 5, A9
 
 Stage 1: fetch once, cache once.
+Stage 2: find all three catalogue pages and every unique book link.
 """
 
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 # --- Config -----------------------------------------------------------------
 
@@ -23,8 +26,9 @@ REQUEST_DELAY_SECONDS = 0.5  # only applied between REAL requests, never on cach
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
-BASE_URL = "Remove-Item -Recurse -Force .git "
+BASE_URL = "https://books.toscrape.com"
 CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
+MAX_CATALOGUE_PAGES = 3
 
 
 # --- Core ---------------------------------------------------------------
@@ -70,8 +74,46 @@ def fetch_and_cache(url: str, cache_filename: str) -> str:
     return response.text
 
 
+def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[str]:
+    """
+    Walk the catalogue starting from page 1, following the site's own
+    "next" link — never hardcoding page-2.html / page-3.html — and collect
+    every unique, absolute book URL along the way.
+    """
+    book_urls: list[str] = []
+    seen: set[str] = set()
+    page_url = CATALOGUE_URL
+    pages_fetched = 0
+
+    for page_num in range(1, max_pages + 1):
+        html = fetch_and_cache(page_url, f"catalogue-page-{page_num}.html")
+        pages_fetched += 1
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Relative links like "the-requiem-red_995/index.html" — always
+        # resolved against the page they came from, never string-glued.
+        for link in soup.select("article.product_pod h3 a"):
+            absolute_url = urljoin(page_url, link.get("href", ""))
+            if absolute_url not in seen:
+                seen.add(absolute_url)
+                book_urls.append(absolute_url)
+
+        next_link = soup.select_one("li.next a")
+        if next_link and page_num < max_pages:
+            page_url = urljoin(page_url, next_link.get("href", ""))
+        else:
+            break
+
+    print(
+        f"catalogue_pages={pages_fetched}  "
+        f"discovered={len(book_urls)}  "
+        f"unique_urls={len(seen)}"
+    )
+    return book_urls
+
+
 def main() -> None:
-    fetch_and_cache(CATALOGUE_URL, "catalogue-page-1.html")
+    discover_book_urls()
 
 
 if __name__ == "__main__":
