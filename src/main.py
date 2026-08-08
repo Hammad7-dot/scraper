@@ -70,6 +70,13 @@ def fetch_and_cache(url: str, cache_filename: str) -> str:
         # per-page handling so one bad page doesn't take the whole run down.
         raise FetchError(f"GET {url} returned {response.status_code}, expected 200")
 
+    # books.toscrape.com doesn't declare a charset in its Content-Type
+    # header, so requests falls back to guessing Latin-1. The page is
+    # actually UTF-8 (confirmed directly), so without this line every
+    # "£" comes back mangled as "Â£" (0xC2 0xA3 misread as two Latin-1
+    # characters instead of one UTF-8 one).
+    response.encoding = "utf-8"
+
     cache_path.write_text(response.text, encoding="utf-8")
     print(f"FETCH      {url}  ({len(response.text):,} bytes)")
 

@@ -50,6 +50,16 @@ python src/main.py
 
 _(Stages beyond fetch/cache are still in progress — this README grows with each stage.)_
 
+## Bugs found & fixed
+
+- **Mojibake in prices (`Â£51.77` instead of `£51.77`).** `books.toscrape.com` doesn't
+  declare a charset in its `Content-Type` header, so `requests` defaulted to guessing
+  Latin-1 instead of the page's actual UTF-8. Fixed by explicitly setting
+  `response.encoding = "utf-8"` before reading `response.text`. Caught by comparing a
+  real scraped record against the live page directly. **Note:** pages already fetched
+  before this fix have the mangled text baked into `cache/` — clear the cache and
+  re-run after pulling this fix.
+
 ## Known limitations / deviations
 
 - `fetched_at` is set to the time the record is *built* (i.e. when the extraction step
@@ -64,6 +74,7 @@ _(Stages beyond fetch/cache are still in progress — this README grows with eac
 - [x] Stage 1 — fetch and cache HTML
 - [x] Stage 2 — discover all three catalogue pages
 - [x] Stage 3 — extract raw records
+- [ ] Stage 4 — clean, validate, store
 - [ ] Stage 4 — clean, validate, store
 - [ ] Stage 5 — survive failures, report the run
 - [ ] Stage 6 — publish evidence
