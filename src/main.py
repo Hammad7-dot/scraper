@@ -5,16 +5,20 @@ FlyRank Internship, Backend Track, Week 5, A9
 Stage 1: fetch once, cache once.
 Stage 2: find all three catalogue pages and every unique book link.
 Stage 3: extract the raw record from each book page.
+Stage 4: clean, validate, and store.
 """
 
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # --- Config -----------------------------------------------------------------
 
@@ -28,6 +32,7 @@ REQUEST_TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 0.5  # only applied between REAL requests, never on cache hits
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 BASE_URL = "https://books.toscrape.com"
 CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
@@ -182,9 +187,89 @@ def extract_all_records(book_entries: list[tuple[str, str]]) -> list[dict]:
     return records
 
 
+# --- Stage 4: clean, validate, store --------------------------------------
+
+
+class BookRecord(BaseModel):
+    """
+    The shape of one finished, trustworthy record. Anything that doesn't
+    fit this shape doesn't make it into books.json.
+    """
+
+    title: str = Field(min_length=1)
+    product_url: str
+    price_text: str
+    price_gbp: float = Field(gt=0)
+    availability_text: str
+    rating_text: str
+    description: Optional[str] = None  # genuinely optional — some books have none
+    source_page: str
+    fetched_at: str
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def must_be_https(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError(f"expected an https:// URL, got: {value!r}")
+        return value
+
+
+def parse_price_gbp(price_text: str) -> float:
+    """'£51.77' -> 51.77. Strips everything but digits and the decimal point."""
+    cleaned = re.sub(r"[^0-9.]", "", price_text or "")
+    return float(cleaned)  # raises ValueError on empty/garbage input, on purpose
+
+
+def clean_and_validate(raw_records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """
+    Turn raw text into a real number, check every record against the
+    schema, and de-duplicate on the canonical URL. A record that fails
+    either check goes to the invalid list with the reason — it never
+    reaches books.json.
+    """
+    valid_records: list[dict] = []
+    invalid_records: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for raw in raw_records:
+        try:
+            price_gbp = parse_price_gbp(raw.get("price_text", ""))
+            record = BookRecord(**raw, price_gbp=price_gbp)
+        except (ValidationError, ValueError, TypeError) as error:
+            invalid_records.append({"record": raw, "reason": str(error)})
+            continue
+
+        if record.product_url in seen_urls:
+            continue  # same book seen twice — identity is the URL, count it once
+        seen_urls.add(record.product_url)
+        valid_records.append(record.model_dump())
+
+    return valid_records, invalid_records
+
+
+def store_records(valid_records: list[dict], invalid_records: list[dict]) -> None:
+    """
+    Overwrite books.json / errors.json with this run's full result — never
+    append. That's what makes re-running the scraper idempotent: the same
+    60 good records every time, not 60 more piled on top.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    (OUTPUT_DIR / "books.json").write_text(
+        json.dumps(valid_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (OUTPUT_DIR / "errors.json").write_text(
+        json.dumps(invalid_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    print(f"valid_records={len(valid_records)}  invalid_records={len(invalid_records)}")
+
+
 def main() -> None:
     book_entries = discover_book_urls()
-    extract_all_records(book_entries)
+    raw_records = extract_all_records(book_entries)
+    valid_records, invalid_records = clean_and_validate(raw_records)
+    store_records(valid_records, invalid_records)
 
 
 if __name__ == "__main__":

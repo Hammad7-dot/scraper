@@ -74,7 +74,8 @@ _(Stages beyond fetch/cache are still in progress — this README grows with eac
 - [x] Stage 1 — fetch and cache HTML
 - [x] Stage 2 — discover all three catalogue pages
 - [x] Stage 3 — extract raw records
-- [ ] Stage 4 — clean, validate, store
+- [x] Stage 4 — clean, validate, store
+- [ ] Stage 5 — survive failures, report the run
 - [ ] Stage 4 — clean, validate, store
 - [ ] Stage 5 — survive failures, report the run
 - [ ] Stage 6 — publish evidence
