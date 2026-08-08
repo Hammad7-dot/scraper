@@ -50,12 +50,20 @@ python src/main.py
 
 _(Stages beyond fetch/cache are still in progress — this README grows with each stage.)_
 
+## Known limitations / deviations
+
+- `fetched_at` is set to the time the record is *built* (i.e. when the extraction step
+  runs), not the time the page was physically fetched over the network. On a cache hit,
+  those two times differ — the HTML was fetched earlier, but `fetched_at` reflects "now."
+  A stricter version would persist the real fetch timestamp alongside each cached file.
+  Noted here rather than silently fixed, per Stage 5's "don't gold-plate" guidance.
+
 ## Status
 
 - [x] Stage 0 — classify target
 - [x] Stage 1 — fetch and cache HTML
 - [x] Stage 2 — discover all three catalogue pages
-- [ ] Stage 3 — extract raw records
+- [x] Stage 3 — extract raw records
 - [ ] Stage 4 — clean, validate, store
 - [ ] Stage 5 — survive failures, report the run
 - [ ] Stage 6 — publish evidence

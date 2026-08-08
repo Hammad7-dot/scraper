@@ -4,9 +4,12 @@ FlyRank Internship, Backend Track, Week 5, A9
 
 Stage 1: fetch once, cache once.
 Stage 2: find all three catalogue pages and every unique book link.
+Stage 3: extract the raw record from each book page.
 """
 
+import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -74,13 +77,14 @@ def fetch_and_cache(url: str, cache_filename: str) -> str:
     return response.text
 
 
-def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[str]:
+def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[tuple[str, str]]:
     """
     Walk the catalogue starting from page 1, following the site's own
     "next" link — never hardcoding page-2.html / page-3.html — and collect
-    every unique, absolute book URL along the way.
+    every unique, absolute book URL along the way, paired with the
+    catalogue page it was found on (for provenance in Stage 3).
     """
-    book_urls: list[str] = []
+    book_entries: list[tuple[str, str]] = []
     seen: set[str] = set()
     page_url = CATALOGUE_URL
     pages_fetched = 0
@@ -96,7 +100,7 @@ def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[str]:
             absolute_url = urljoin(page_url, link.get("href", ""))
             if absolute_url not in seen:
                 seen.add(absolute_url)
-                book_urls.append(absolute_url)
+                book_entries.append((absolute_url, page_url))
 
         next_link = soup.select_one("li.next a")
         if next_link and page_num < max_pages:
@@ -106,14 +110,74 @@ def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[str]:
 
     print(
         f"catalogue_pages={pages_fetched}  "
-        f"discovered={len(book_urls)}  "
+        f"discovered={len(book_entries)}  "
         f"unique_urls={len(seen)}"
     )
-    return book_urls
+    return book_entries
+
+
+def extract_book_record(book_url: str, source_page: str) -> dict:
+    """
+    Fetch one book's detail page (politely, via the same cache) and pull
+    the eight raw fields the assignment asks for. Selectors are aimed at
+    the product_main container specifically, not the whole document, so a
+    second price or rating elsewhere on the page can't get picked up by
+    accident.
+    """
+    slug = book_url.rstrip("/").split("/")[-2]
+    html = fetch_and_cache(book_url, f"book-{slug}.html")
+    soup = BeautifulSoup(html, "html.parser")
+
+    product_main = soup.select_one("div.product_main")
+
+    title_el = product_main.select_one("h1") if product_main else None
+    title = title_el.get_text(strip=True) if title_el else None
+
+    price_el = product_main.select_one("p.price_color") if product_main else None
+    price_text = price_el.get_text(strip=True) if price_el else None
+
+    availability_el = product_main.select_one("p.availability") if product_main else None
+    # Collapses the icon/newline whitespace inside this tag down to one
+    # clean string, e.g. "In stock (22 available)".
+    availability_text = (
+        " ".join(availability_el.get_text().split()) if availability_el else None
+    )
+
+    rating_el = product_main.select_one("p.star-rating") if product_main else None
+    rating_text = None
+    if rating_el:
+        classes = rating_el.get("class", [])
+        rating_text = next((c for c in classes if c != "star-rating"), None)
+
+    # Not every book has a description. We store None rather than invent
+    # text that was never on the page.
+    description_el = soup.select_one("#product_description ~ p")
+    description = description_el.get_text(strip=True) if description_el else None
+
+    return {
+        "title": title,
+        "product_url": book_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def extract_all_records(book_entries: list[tuple[str, str]]) -> list[dict]:
+    records = [extract_book_record(url, source) for url, source in book_entries]
+
+    if records:
+        print(json.dumps(records[0], indent=2, ensure_ascii=False))
+    print(f"detail_pages={len(records)}")
+    return records
 
 
 def main() -> None:
-    discover_book_urls()
+    book_entries = discover_book_urls()
+    extract_all_records(book_entries)
 
 
 if __name__ == "__main__":
