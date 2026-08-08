@@ -6,11 +6,13 @@ Stage 1: fetch once, cache once.
 Stage 2: find all three catalogue pages and every unique book link.
 Stage 3: extract the raw record from each book page.
 Stage 4: clean, validate, and store.
+Stage 5: survive failures, report the run.
 """
 
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -30,6 +32,8 @@ USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/Hammad7-dot/scraper)"
 
 REQUEST_TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 0.5  # only applied between REAL requests, never on cache hits
+MAX_ATTEMPTS = 2  # 1 try + 1 retry, only for timeouts / connection errors / 5xx
+RETRY_DELAY_SECONDS = 1.0
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -38,15 +42,30 @@ BASE_URL = "https://books.toscrape.com"
 CATALOGUE_URL = f"{BASE_URL}/catalogue/page-1.html"
 MAX_CATALOGUE_PAGES = 3
 
+# Stage 5 checkpoint switch: flip to True for one run to prove a broken
+# page can't take the whole run down, then flip back to False. Never
+# leave this on for a normal run — it deliberately breaks one URL.
+INJECT_FAKE_BOOK_FOR_TESTING = False
+
+
+@dataclass
+class RunStats:
+    """Tracks what actually happened during one run, for the final report."""
+
+    start_time: datetime
+    pages_fetched: int = 0
+    cache_hits: int = 0
+    failed_pages: list = field(default_factory=list)  # [{"url":..., "reason":...}]
+
 
 # --- Core ---------------------------------------------------------------
 
 
 class FetchError(Exception):
-    """Raised when a page can't be fetched and isn't a 200."""
+    """Raised when a page can't be fetched after retries (or shouldn't be retried)."""
 
 
-def fetch_and_cache(url: str, cache_filename: str) -> str:
+def fetch_and_cache(url: str, cache_filename: str, stats: RunStats) -> str:
     """
     Return the HTML for `url`, reading from cache/ if we already have it.
 
@@ -55,41 +74,70 @@ def fetch_and_cache(url: str, cache_filename: str) -> str:
       - honest, identifying user-agent
       - timeout, so a hung connection can't wait forever
       - status code checked before the body is trusted
+
+    Retry policy: a timeout, connection error, or 5xx gets ONE retry after
+    a short pause — those are the failures that are plausibly transient.
+    A 404 or 403 is never retried — the page doesn't exist, or the site
+    said no, and asking again won't change either of those.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / cache_filename
 
     if cache_path.exists():
         html = cache_path.read_text(encoding="utf-8")
+        stats.cache_hits += 1
         print(f"CACHE HIT  {url}  ({len(html):,} bytes)")
         return html
 
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
+    last_reason = "unknown error"
 
-    if response.status_code != 200:
-        # Stage 1 keeps this simple and loud. Stage 5 replaces this with
-        # per-page handling so one bad page doesn't take the whole run down.
-        raise FetchError(f"GET {url} returned {response.status_code}, expected 200")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+            last_reason = f"{type(error).__name__}: {error}"
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            break
 
-    # books.toscrape.com doesn't declare a charset in its Content-Type
-    # header, so requests falls back to guessing Latin-1. The page is
-    # actually UTF-8 (confirmed directly), so without this line every
-    # "£" comes back mangled as "Â£" (0xC2 0xA3 misread as two Latin-1
-    # characters instead of one UTF-8 one).
-    response.encoding = "utf-8"
+        if response.status_code == 200:
+            # books.toscrape.com doesn't declare a charset in its
+            # Content-Type header, so requests falls back to guessing
+            # Latin-1. The page is actually UTF-8 (confirmed directly),
+            # so without this line every "£" comes back mangled as "Â£".
+            response.encoding = "utf-8"
+            cache_path.write_text(response.text, encoding="utf-8")
+            stats.pages_fetched += 1
+            print(f"FETCH      {url}  ({len(response.text):,} bytes)")
+            time.sleep(REQUEST_DELAY_SECONDS)
+            return response.text
 
-    cache_path.write_text(response.text, encoding="utf-8")
-    print(f"FETCH      {url}  ({len(response.text):,} bytes)")
+        if response.status_code in (404, 403):
+            # Not retryable, per the assignment: 404 means the page
+            # doesn't exist, 403 means the site said no. Asking again
+            # is either pointless or rude.
+            last_reason = f"HTTP {response.status_code}"
+            break
 
-    time.sleep(REQUEST_DELAY_SECONDS)
-    return response.text
+        # Anything else (5xx, etc.) is treated as possibly transient.
+        last_reason = f"HTTP {response.status_code}"
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(RETRY_DELAY_SECONDS)
+            continue
+        break
+
+    stats.failed_pages.append({"url": url, "reason": last_reason})
+    raise FetchError(f"GET {url} failed: {last_reason}")
 
 
-def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[tuple[str, str]]:
+def discover_book_urls(
+    stats: RunStats, max_pages: int = MAX_CATALOGUE_PAGES
+) -> list[tuple[str, str]]:
     """
     Walk the catalogue starting from page 1, following the site's own
     "next" link — never hardcoding page-2.html / page-3.html — and collect
@@ -102,7 +150,13 @@ def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[tuple[str, 
     pages_fetched = 0
 
     for page_num in range(1, max_pages + 1):
-        html = fetch_and_cache(page_url, f"catalogue-page-{page_num}.html")
+        try:
+            html = fetch_and_cache(page_url, f"catalogue-page-{page_num}.html", stats)
+        except FetchError:
+            # A broken catalogue page means we can't find its "next" link
+            # either, so pagination stops here — but whatever books we've
+            # already found from earlier pages are still kept.
+            break
         pages_fetched += 1
         soup = BeautifulSoup(html, "html.parser")
 
@@ -120,6 +174,11 @@ def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[tuple[str, 
         else:
             break
 
+    if INJECT_FAKE_BOOK_FOR_TESTING:
+        fake_url = f"{BASE_URL}/catalogue/this-book-does-not-exist-fake_0000/index.html"
+        book_entries.append((fake_url, CATALOGUE_URL))
+        print(f"[TEST] injected a deliberately broken URL: {fake_url}")
+
     print(
         f"catalogue_pages={pages_fetched}  "
         f"discovered={len(book_entries)}  "
@@ -128,16 +187,22 @@ def discover_book_urls(max_pages: int = MAX_CATALOGUE_PAGES) -> list[tuple[str, 
     return book_entries
 
 
-def extract_book_record(book_url: str, source_page: str) -> dict:
+def extract_book_record(book_url: str, source_page: str, stats: RunStats) -> Optional[dict]:
     """
     Fetch one book's detail page (politely, via the same cache) and pull
     the eight raw fields the assignment asks for. Selectors are aimed at
     the product_main container specifically, not the whole document, so a
     second price or rating elsewhere on the page can't get picked up by
-    accident.
+    accident. Returns None (instead of raising) if the page couldn't be
+    fetched at all — one bad book shouldn't stop the other 59.
     """
     slug = book_url.rstrip("/").split("/")[-2]
-    html = fetch_and_cache(book_url, f"book-{slug}.html")
+    try:
+        html = fetch_and_cache(book_url, f"book-{slug}.html", stats)
+    except FetchError as error:
+        print(f"SKIP       {book_url}  ({error})")
+        return None
+
     soup = BeautifulSoup(html, "html.parser")
 
     product_main = soup.select_one("div.product_main")
@@ -178,8 +243,12 @@ def extract_book_record(book_url: str, source_page: str) -> dict:
     }
 
 
-def extract_all_records(book_entries: list[tuple[str, str]]) -> list[dict]:
-    records = [extract_book_record(url, source) for url, source in book_entries]
+def extract_all_records(book_entries: list[tuple[str, str]], stats: RunStats) -> list[dict]:
+    records = [
+        record
+        for url, source in book_entries
+        if (record := extract_book_record(url, source, stats)) is not None
+    ]
 
     if records:
         print(json.dumps(records[0], indent=2, ensure_ascii=False))
@@ -265,11 +334,42 @@ def store_records(valid_records: list[dict], invalid_records: list[dict]) -> Non
     print(f"valid_records={len(valid_records)}  invalid_records={len(invalid_records)}")
 
 
+# --- Stage 5: report the run ------------------------------------------------
+
+
+def build_and_store_run_report(
+    stats: RunStats, valid_count: int, invalid_count: int
+) -> dict:
+    """
+    A scraper that reports nothing can fail silently for weeks. This is
+    the honest summary of what actually happened, written every run.
+    """
+    finished_at = datetime.now(timezone.utc)
+    report = {
+        "start_time": stats.start_time.isoformat(),
+        "duration_seconds": round((finished_at - stats.start_time).total_seconds(), 2),
+        "pages_fetched": stats.pages_fetched,
+        "cache_hits": stats.cache_hits,
+        "valid_records": valid_count,
+        "invalid_records": invalid_count,
+        "failed_pages": stats.failed_pages,
+    }
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "run-report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return report
+
+
 def main() -> None:
-    book_entries = discover_book_urls()
-    raw_records = extract_all_records(book_entries)
+    stats = RunStats(start_time=datetime.now(timezone.utc))
+    book_entries = discover_book_urls(stats)
+    raw_records = extract_all_records(book_entries, stats)
     valid_records, invalid_records = clean_and_validate(raw_records)
     store_records(valid_records, invalid_records)
+    build_and_store_run_report(stats, len(valid_records), len(invalid_records))
 
 
 if __name__ == "__main__":

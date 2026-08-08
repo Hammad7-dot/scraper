@@ -50,6 +50,21 @@ python src/main.py
 
 _(Stages beyond fetch/cache are still in progress — this README grows with each stage.)_
 
+## Resilience & the run report
+
+- A timeout, connection error, or 5xx gets **one retry** after a short pause — those are
+  plausibly transient. A **404 or 403 is never retried**: the page doesn't exist, or the
+  site said no, and asking again doesn't change either.
+- One broken book page is logged and skipped (`SKIP` in the output) — it doesn't stop the
+  other 59 from being scraped.
+- Every run writes `output/run-report.json`: start time, duration, pages actually
+  fetched, cache hits, valid/invalid record counts, and a list of any failed pages with
+  the reason.
+- Proven with a deliberately broken URL: flip `INJECT_FAKE_BOOK_FOR_TESTING = True` in
+  `src/main.py` for one run, then flip it back. See `run-report.json` from that run for
+  the proof — `failed_pages` should show exactly one entry, and `valid_records` should
+  still be 60.
+
 ## Bugs found & fixed
 
 - **Mojibake in prices (`Â£51.77` instead of `£51.77`).** `books.toscrape.com` doesn't
@@ -75,7 +90,7 @@ _(Stages beyond fetch/cache are still in progress — this README grows with eac
 - [x] Stage 2 — discover all three catalogue pages
 - [x] Stage 3 — extract raw records
 - [x] Stage 4 — clean, validate, store
-- [ ] Stage 5 — survive failures, report the run
+- [x] Stage 5 — survive failures, report the run
 - [ ] Stage 4 — clean, validate, store
 - [ ] Stage 5 — survive failures, report the run
 - [ ] Stage 6 — publish evidence
